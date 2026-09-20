@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import os
 import json
 import re
 import subprocess
@@ -51,6 +52,10 @@ UA = "ytm-dl/2.0 (uso pessoal)"
 DURATION_TOLERANCE = 3  # segundos, ao casar no Deezer
 DUP_TOLERANCE = 5       # segundos, ao considerar duas faixas a mesma musica
 NET_TIMEOUT = 15
+
+# Caminho do ffmpeg. A interface grafica baixa uma build estatica propria e
+# aponta para ela por aqui, para nao exigir Homebrew de quem nao usa terminal.
+FFMPEG = os.environ.get("YTMDL_FFMPEG") or "ffmpeg"
 
 
 @dataclass(frozen=True)
@@ -418,7 +423,7 @@ def to_aiff(src: Path, bits: int, rate: int | None) -> Path:
     big-endian — dai o `be` no codec.
     """
     out = src.with_suffix(".aiff")
-    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src),
+    cmd = [FFMPEG, "-v", "error", "-y", "-i", str(src),
            "-acodec", "pcm_s16be" if bits == 16 else "pcm_s24be", "-ac", "2"]
     if rate:
         cmd += ["-ar", str(rate)]
@@ -807,22 +812,221 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="mostra o que seria baixado e etiquetado, sem baixar")
     args = p.parse_args()
+    return run_job(args, TextEmitter())
 
+
+# ----------------------------------------------------------------- eventos ---
+
+
+class Emitter:
+    """
+    Recebe os acontecimentos de um job.
+
+    Existe para separar o que acontece de como e mostrado: a CLI imprime
+    texto, a interface web serializa em JSON. Sem isto a web teria que
+    interpretar a saida do terminal, que e frágil e quebra a cada ajuste de
+    mensagem.
+    """
+
+    def reading(self) -> None: ...
+    def head(self, playlist: str, count: int, dest: Path, fmt: str,
+             dry_run: bool) -> None: ...
+    def present(self, n: int, ext: str, next_num: int, pooling: bool) -> None: ...
+    def track(self, idx: int, total: int, label: str) -> None: ...
+    def progress(self, idx: int, d: dict) -> None: ...
+    def skipped(self, idx: int, label: str, path: Path, estado: str) -> None: ...
+    def dup(self, idx: int, label: str, other: Path) -> None: ...
+    def orphan(self, idx: int, label: str, other: Path | None, ext: str) -> None: ...
+    def failed(self, idx: int, label: str, motivo: str) -> None: ...
+    def dry(self, idx: int, label: str, meta: Meta) -> None: ...
+    def done(self, idx: int, label: str, path: Path, meta: Meta,
+             tag_err: str) -> None: ...
+    def summary(self, data: dict) -> None: ...
+
+
+class TextEmitter(Emitter):
+    """Saida de terminal."""
+
+    def reading(self) -> None:
+        print("-> lendo a playlist...")
+
+    def head(self, playlist, count, dest, fmt, dry_run):
+        print(f"-> playlist : {playlist}")
+        print(f"-> faixas   : {count}")
+        print(f"-> destino  : {dest}")
+        print(f"-> formato  : {fmt}")
+        if dry_run:
+            print("-> DRY RUN  : nada sera baixado")
+        print()
+
+    def present(self, n, ext, next_num, pooling):
+        print(f"-> ja na pasta: {n} arquivo(s) .{ext}"
+              + (f", numerando a partir de {next_num:02d}" if pooling else ""))
+        print()
+
+    def track(self, idx, total, label):
+        print(f"[{idx:02d}/{total:02d}] {label}")
+
+    def progress(self, idx, d):
+        if d.get("status") != "downloading":
+            return
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        if total:
+            pct = (d.get("downloaded_bytes") or 0) / total * 100
+            print(f"\r        baixando {pct:5.1f}%", end="", flush=True)
+
+    @staticmethod
+    def _limpa():
+        print("\r" + " " * 30 + "\r", end="")
+
+    def skipped(self, idx, label, path, estado):
+        self._limpa()
+        print(f"        = ja baixada: {path.name}"
+              f" ({human(path.stat().st_size)}) | {estado}\n")
+
+    def dup(self, idx, label, other):
+        self._limpa()
+        print(f"        = ja existe na pasta: {other.name} — pulando duplicata\n")
+
+    def orphan(self, idx, label, other, ext):
+        if other:
+            print(f"        ! so existe em {other.suffix} ({other.name})"
+                  f" — gerando .{ext}")
+        else:
+            print("        ! no historico, mas ausente da pasta — rebaixando")
+
+    def failed(self, idx, label, motivo):
+        self._limpa()
+        print(f"        x {motivo}\n")
+
+    def dry(self, idx, label, meta):
+        print(f"        titulo : {meta.title}")
+        print(f"        artista: {meta.artist}")
+        print(f"        album  : {meta.album or '(vazio)'}")
+        print(f"        genero : {'; '.join(meta.genres) or '(vazio)'}")
+        print(f"        capa   : {meta.cover_dim or '(nenhuma)'}")
+        if meta.note:
+            print(f"        nota   : {meta.note}")
+        print()
+
+    def done(self, idx, label, path, meta, tag_err):
+        self._limpa()
+        bits = [f"OK {human(path.stat().st_size)}"]
+        if meta.genres:
+            bits.append("; ".join(meta.genres))
+        if meta.cover:
+            bits.append(f"capa {meta.cover_dim}")
+        if meta.label:
+            bits.append(meta.label)
+        print("        " + " | ".join(bits))
+        if meta.note:
+            print(f"        ! {meta.note}")
+        if tag_err:
+            print(f"        ! {tag_err}")
+        print()
+
+    def summary(self, d):
+        print("=" * 62)
+        print(f"{d['total']} faixa(s) na playlist")
+        if d["skipped"]:
+            print(f"  {len(d['skipped']):>3} ja estavam na pasta (puladas)")
+        if d["dups"]:
+            print(f"  {len(d['dups']):>3} repetidas — a musica ja estava na pasta"
+                  " (puladas)")
+        if d["novas"]:
+            verbo = "seriam baixadas" if d["dry_run"] else "baixadas agora"
+            extra = "" if d["no_enrich"] else f" | {d['rich']} com genero/capa do Deezer"
+            print(f"  {len(d['novas']):>3} {verbo}{extra}")
+        if d["failed"]:
+            print(f"  {len(d['failed']):>3} falharam")
+        if not any((d["skipped"], d["novas"], d["failed"], d["dups"])):
+            print("  nada a fazer")
+
+        if d["dups"]:
+            print("\nrepetidas (mesma musica ja presente na pasta):")
+            for idx, label, path in d["dups"]:
+                print(f"  {idx:02d} - {label}  ->  {path.name}")
+
+        if d["incompletas"]:
+            print("\nja na pasta, porem com metadata incompleta:")
+            for idx, label, _path, estado in d["incompletas"]:
+                print(f"  {idx:02d} - {label}: {estado}")
+            print("  para reetiquetar, apague esses arquivos e rode de novo (ou use -f)")
+
+        if d["faltando"]:
+            print("\nsem enriquecimento:")
+            for idx, label, meta, _ in d["faltando"]:
+                print(f"  {idx:02d} - {label}: {meta.note or 'sem dados'}")
+
+        if d["failed"]:
+            print("\nfalharam:")
+            for idx, label, motivo in d["failed"]:
+                print(f"  {idx:02d} - {label}: {motivo}")
+
+        if not d["dry_run"]:
+            print(f"\ndestino: {d['dest']}")
+
+
+class YtdlLogger:
+    """
+    Captura o ultimo erro do yt-dlp.
+
+    Sem isto, uma faixa que falha por 403 no download aparecia como
+    "pos-processamento falhou" — a ausencia de arquivo era atribuida ao passo
+    errado. Tambem silencia a barra de progresso do yt-dlp, que ficava
+    concatenada em cima da nossa saida; o progresso agora e desenhado pelo
+    emissor.
+    """
+
+    def __init__(self) -> None:
+        self.ultimo_erro = ""
+
+    def debug(self, msg: str) -> None: ...
+    def info(self, msg: str) -> None: ...
+
+    def warning(self, msg: str) -> None: ...
+
+    def error(self, msg: str) -> None:
+        self.ultimo_erro = re.sub(r"^ERROR:\s*", "", str(msg).strip())
+
+
+# --------------------------------------------------------------------- job ---
+
+
+def describe_format(args: argparse.Namespace) -> str:
+    spec = FORMATS[args.format]
+    if spec.lossless:
+        detalhe = (f"{args.bits} bits {args.rate or 48000} Hz"
+                   if spec.codec in ("wav", "flac", "alac") else "")
+    else:
+        detalhe = (f"{args.bitrate or spec.quality} kbps" if spec.quality
+                   else "copia direta da fonte")
+    return (f".{spec.ext} ({args.format}) {detalhe}"
+            f"{'' if args.no_enrich else ' + metadados do Deezer'}")
+
+
+def resolve_dest(args: argparse.Namespace, playlist_title: str) -> Path:
+    if args.folder:
+        folder = Path(args.folder).expanduser()
+        return folder if folder.is_absolute() else args.dest / sanitize(args.folder)
+    return args.dest / sanitize(playlist_title)
+
+
+def run_job(args: argparse.Namespace, em: Emitter) -> int:
+    """Executa um download completo, publicando cada acontecimento em `em`."""
     spec = FORMATS[args.format]
     base_opts: dict[str, Any] = {"quiet": True, "no_warnings": True}
+    if FFMPEG != "ffmpeg":
+        base_opts["ffmpeg_location"] = FFMPEG
     if args.cookies:
         base_opts["cookiesfrombrowser"] = (args.cookies,)
 
-    print("-> lendo a playlist...")
+    em.reading()
     playlist_title, entries = probe(args.url, base_opts)
     if args.limit:
         entries = entries[: args.limit]
 
-    if args.folder:
-        folder = Path(args.folder).expanduser()
-        dest = folder if folder.is_absolute() else args.dest / sanitize(args.folder)
-    else:
-        dest = args.dest / sanitize(playlist_title)
+    dest = resolve_dest(args, playlist_title)
     pooling = bool(args.folder)
     archive = dest / ".ytm-dl-baixados.txt"
     if not args.dry_run:
@@ -830,20 +1034,7 @@ def main() -> int:
         if args.force and archive.exists():
             archive.unlink()
 
-    print(f"-> playlist : {playlist_title}")
-    print(f"-> faixas   : {len(entries)}")
-    print(f"-> destino  : {dest}")
-    if spec.lossless:
-        detalhe = (f"{args.bits} bits {args.rate or 48000} Hz"
-                   if spec.codec in ("wav", "flac", "alac") else "")
-    else:
-        detalhe = (f"{args.bitrate or spec.quality} kbps" if spec.quality
-                   else "copia direta da fonte")
-    print(f"-> formato  : .{spec.ext} ({args.format}) {detalhe}"
-          f"{'' if args.no_enrich else ' + metadados do Deezer'}")
-    if args.dry_run:
-        print("-> DRY RUN  : nada sera baixado")
-    print()
+    em.head(playlist_title, len(entries), dest, describe_format(args), args.dry_run)
 
     report: list[tuple[int, str, Meta | None, str]] = []
     skipped: list[tuple[int, str, Path, str]] = []
@@ -860,17 +1051,14 @@ def main() -> int:
     # Numa pasta compartilhada a posicao na playlist nao serve de nome: a
     # numeracao continua de onde a pasta parou.
     next_num = (max(present) if present else 0) + 1
-
     if present:
-        print(f"-> ja na pasta: {len(present)} arquivo(s) .{spec.ext}"
-              + (f", numerando a partir de {next_num:02d}" if pooling else ""))
-        print()
+        em.present(len(present), spec.ext, next_num, pooling)
 
     for idx, entry in enumerate(entries, start=1):
         video_url = entry.get("url") or entry.get("webpage_url") or entry.get("id")
         vid = entry.get("id") or ""
         label = entry.get("title") or video_url
-        print(f"[{idx:02d}/{len(entries):02d}] {label}")
+        em.track(idx, len(entries), label)
 
         existing = None if pooling else present.get(idx)
         file_ok = (
@@ -882,8 +1070,7 @@ def main() -> int:
 
         if file_ok and not args.force:
             estado = inspect_existing(existing)
-            print(f"        = ja baixada: {existing.name}"
-                  f" ({human(existing.stat().st_size)}) | {estado}\n")
+            em.skipped(idx, label, existing, estado)
             skipped.append((idx, label, existing, estado))
             continue
 
@@ -897,8 +1084,7 @@ def main() -> int:
                 float(entry.get("duration") or 0),
             )
             if dup:
-                print(f"        = ja existe na pasta: {dup.path.name}"
-                      f" — pulando duplicata\n")
+                em.dup(idx, label, dup.path)
                 dups.append((idx, label, dup.path))
                 continue
 
@@ -907,22 +1093,21 @@ def main() -> int:
         # pular para sempre uma faixa que nao existe mais em disco.
         orfa = in_archive
         if orfa:
-            outro = outro_present.get(idx)
-            if outro:
-                print(f"        ! so existe em {outro.suffix} ({outro.name})"
-                      f" — gerando .{spec.ext}")
-            else:
-                print("        ! no historico, mas ausente da pasta — rebaixando")
+            em.orphan(idx, label, outro_present.get(idx), spec.ext)
 
         out_idx = next_num if pooling else idx
+        log = YtdlLogger()
         ydl_opts: dict[str, Any] = {
             **base_opts,
+            "logger": log,
+            "noprogress": True,
             "format": "bestaudio/best",
             "outtmpl": str(dest / f"{out_idx:02d} - %(title)s.%(ext)s"),
             "retries": 10,
             "fragment_retries": 10,
             "concurrent_fragment_downloads": args.jobs,
             "ignoreerrors": True,
+            "progress_hooks": [lambda d, i=idx: em.progress(i, d)],
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": spec.codec,
@@ -962,8 +1147,9 @@ def main() -> int:
                 info = ydl.extract_info(video_url, download=True)
 
         if not info:
-            print("        x falhou ao baixar\n")
-            failed.append((idx, label, "download falhou"))
+            motivo = log.ultimo_erro or "falhou ao baixar"
+            em.failed(idx, label, motivo)
+            failed.append((idx, label, motivo))
             continue
 
         meta = Meta(
@@ -976,7 +1162,8 @@ def main() -> int:
         duration = float(info.get("duration") or 0)
 
         downloads = info.get("requested_downloads") or []
-        path = Path(downloads[0]["filepath"]) if downloads and downloads[0].get("filepath") else None
+        path = (Path(downloads[0]["filepath"])
+                if downloads and downloads[0].get("filepath") else None)
 
         if not args.dry_run and path is None:
             # O yt-dlp nao produziu arquivo. Antes isto virava "falhou ao
@@ -985,12 +1172,12 @@ def main() -> int:
             achado = scan_dest(dest, spec.ext).get(idx)
             if achado:
                 estado = inspect_existing(achado)
-                print(f"        = ja baixada: {achado.name}"
-                      f" ({human(achado.stat().st_size)}) | {estado}\n")
+                em.skipped(idx, label, achado, estado)
                 skipped.append((idx, label, achado, estado))
             else:
-                print("        x nao gerou arquivo (pos-processamento falhou)\n")
-                failed.append((idx, label, "pos-processamento falhou"))
+                motivo = log.ultimo_erro or "nao gerou arquivo"
+                em.failed(idx, label, motivo)
+                failed.append((idx, label, motivo))
             continue
 
         if not args.no_enrich:
@@ -998,14 +1185,7 @@ def main() -> int:
                           tolerance=args.tolerance, loose=args.loose)
 
         if args.dry_run:
-            print(f"        titulo : {meta.title}")
-            print(f"        artista: {meta.artist}")
-            print(f"        album  : {meta.album or '(vazio)'}")
-            print(f"        genero : {'; '.join(meta.genres) or '(vazio)'}")
-            print(f"        capa   : {meta.cover_dim or '(nenhuma)'}")
-            if meta.note:
-                print(f"        nota   : {meta.note}")
-            print()
+            em.dry(idx, label, meta)
             if pooling:
                 next_num += 1
                 library.append(LibEntry(dest / f"{out_idx:02d}", meta.title,
@@ -1018,7 +1198,7 @@ def main() -> int:
                 path = to_aiff(path, args.bits, args.rate)
             except subprocess.CalledProcessError as exc:
                 erro = (exc.stderr or b"").decode(errors="replace").strip()
-                print(f"        x falhou ao converter para AIFF: {erro[:120]}\n")
+                em.failed(idx, label, f"falhou ao converter para AIFF: {erro[:120]}")
                 failed.append((idx, label, "conversao para AIFF falhou"))
                 continue
 
@@ -1032,66 +1212,24 @@ def main() -> int:
             next_num += 1
             library.append(LibEntry(path, meta.title, meta.artist, duration))
 
-        size = human(path.stat().st_size)
-        bits = [f"OK {size}"]
-        if meta.genres:
-            bits.append("; ".join(meta.genres))
-        if meta.cover:
-            bits.append(f"capa {meta.cover_dim}")
-        if meta.label:
-            bits.append(meta.label)
-        print("        " + " | ".join(bits))
-        if meta.note:
-            print(f"        ! {meta.note}")
-        if tag_err:
-            print(f"        ! {tag_err}")
-        print()
+        em.done(idx, label, path, meta, tag_err)
         report.append((idx, label, meta, tag_err))
 
-    # ------------------------------------------------------------- resumo ---
     novas = [r for r in report if r[2] is not None]
-    rich = [r for r in novas if r[2].enriched]
-
-    print("=" * 62)
-    print(f"{len(entries)} faixa(s) na playlist")
-    if skipped:
-        print(f"  {len(skipped):>3} ja estavam na pasta (puladas)")
-    if dups:
-        print(f"  {len(dups):>3} repetidas — a musica ja estava na pasta (puladas)")
-    if novas:
-        verbo = "seriam baixadas" if args.dry_run else "baixadas agora"
-        extra = "" if args.no_enrich else f" | {len(rich)} com genero/capa do Deezer"
-        print(f"  {len(novas):>3} {verbo}{extra}")
-    if failed:
-        print(f"  {len(failed):>3} falharam")
-    if not skipped and not novas and not failed and not dups:
-        print("  nada a fazer")
-
-    if dups:
-        print("\nrepetidas (mesma musica ja presente na pasta):")
-        for idx, label, path in dups:
-            print(f"  {idx:02d} - {label}  ->  {path.name}")
-
-    incompletas = [s_ for s_ in skipped if "sem capa" in s_[3] or "sem genero" in s_[3]]
-    if incompletas:
-        print("\nja na pasta, porem com metadata incompleta:")
-        for idx, label, _path, estado in incompletas:
-            print(f"  {idx:02d} - {label}: {estado}")
-        print("  para reetiquetar, apague esses arquivos e rode de novo (ou use -f)")
-
-    faltando = [r for r in novas if not r[2].enriched]
-    if faltando:
-        print("\nsem enriquecimento:")
-        for idx, label, meta, _ in faltando:
-            print(f"  {idx:02d} - {label}: {meta.note or 'sem dados'}")
-
-    if failed:
-        print("\nfalharam:")
-        for idx, label, motivo in failed:
-            print(f"  {idx:02d} - {label}: {motivo}")
-
-    if not args.dry_run:
-        print(f"\ndestino: {dest}")
+    em.summary({
+        "total": len(entries),
+        "dest": dest,
+        "dry_run": args.dry_run,
+        "no_enrich": args.no_enrich,
+        "skipped": skipped,
+        "dups": dups,
+        "failed": failed,
+        "novas": novas,
+        "rich": len([r for r in novas if r[2].enriched]),
+        "incompletas": [x for x in skipped
+                        if "sem capa" in x[3] or "sem genero" in x[3]],
+        "faltando": [r for r in novas if not r[2].enriched],
+    })
     return 0
 
 

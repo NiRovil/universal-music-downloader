@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ytm-dl</title>
+<style>
+:root{
+  --bg:#f6f6f7; --card:#fff; --txt:#1a1a1c; --fraco:#6b6b73; --borda:#e2e2e6;
+  --acento:#2b6ef6; --ok:#1a8f4c; --alerta:#b46a00; --erro:#c0392b;
+  --barra:#e8e8ec;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-tema="claro"]){
+    --bg:#16161a; --card:#1e1e24; --txt:#ececf0; --fraco:#9a9aa4; --borda:#2e2e37;
+    --acento:#5b93ff; --ok:#3fbd72; --alerta:#e0a33c; --erro:#f0655a;
+    --barra:#2a2a33;
+  }
+}
+*{box-sizing:border-box}
+body{
+  margin:0; padding:24px 16px 64px; background:var(--bg); color:var(--txt);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;
+}
+.wrap{max-width:780px;margin:0 auto}
+h1{font-size:22px;margin:0 0 2px;letter-spacing:-.02em}
+.sub{color:var(--fraco);font-size:13px;margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--borda);border-radius:12px;
+      padding:18px;margin-bottom:14px}
+label{display:block;font-size:12px;font-weight:600;color:var(--fraco);
+      text-transform:uppercase;letter-spacing:.04em;margin:0 0 6px}
+input[type=text],select,input[type=number]{
+  width:100%;padding:10px 12px;border:1px solid var(--borda);border-radius:8px;
+  background:var(--bg);color:var(--txt);font-size:14px;font-family:inherit}
+input:focus,select:focus{outline:2px solid var(--acento);outline-offset:-1px}
+.linha{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+.linha>div{flex:1;min-width:150px}
+button{
+  padding:10px 18px;border:0;border-radius:8px;background:var(--acento);color:#fff;
+  font-size:14px;font-weight:600;font-family:inherit;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button.sec{background:var(--barra);color:var(--txt)}
+.pasta{display:flex;gap:8px}
+.pasta input{flex:1}
+details{margin-top:14px}
+summary{cursor:pointer;font-size:13px;color:var(--fraco);user-select:none}
+.opcoes{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;font-size:13px}
+.opcoes label{display:flex;align-items:center;gap:6px;text-transform:none;
+              font-weight:400;color:var(--txt);font-size:13px;letter-spacing:0}
+.acoes{margin-top:16px;display:flex;gap:10px;align-items:center}
+.faixa{display:flex;gap:12px;align-items:center;padding:10px 0;
+       border-bottom:1px solid var(--borda)}
+.faixa:last-child{border-bottom:0}
+.capa{width:44px;height:44px;border-radius:6px;background:var(--barra);
+      flex:0 0 44px;object-fit:cover}
+.info{flex:1;min-width:0}
+.nome{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14px}
+.det{font-size:12px;color:var(--fraco);margin-top:2px;
+     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.barra{height:4px;background:var(--barra);border-radius:2px;margin-top:6px;
+       overflow:hidden}
+.barra i{display:block;height:100%;background:var(--acento);width:0;
+         transition:width .2s}
+.tag{font-size:11px;font-weight:600;padding:2px 7px;border-radius:99px;
+     background:var(--barra);color:var(--fraco);white-space:nowrap}
+.tag.ok{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+.tag.pulada{background:color-mix(in srgb,var(--alerta) 18%,transparent);color:var(--alerta)}
+.tag.erro{background:color-mix(in srgb,var(--erro) 18%,transparent);color:var(--erro)}
+.aviso{background:color-mix(in srgb,var(--alerta) 12%,var(--card));
+       border-color:color-mix(in srgb,var(--alerta) 35%,var(--borda))}
+.resumo{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px}
+.resumo div{font-size:13px}
+.resumo b{display:block;font-size:22px;font-weight:600;letter-spacing:-.02em}
+.oculto{display:none}
+.destino{font-size:12px;color:var(--fraco);word-break:break-all;margin-top:8px}
+.nota{font-size:12px;color:var(--alerta);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ytm-dl</h1>
+  <p class="sub">Baixa playlists do YouTube Music com capa, gênero e gravadora.</p>
+
+  <div id="avisoFf" class="card aviso oculto">
+    <strong>Falta um componente de áudio</strong>
+    <p style="margin:6px 0 0;font-size:13px;color:var(--fraco)">
+      O conversor de áudio (ffmpeg) não está instalado. São cerca de 45 MB,
+      baixados uma única vez para dentro da pasta do app.
+    </p>
+    <div class="barra oculto" id="barraFf" style="margin-top:12px"><i></i></div>
+    <div class="acoes">
+      <button id="btnFf">Baixar agora</button>
+      <span id="statusFf" style="font-size:13px;color:var(--fraco)"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <label for="url">Link da playlist</label>
+    <input type="text" id="url" placeholder="https://music.youtube.com/playlist?list=..."
+           autocomplete="off" spellcheck="false">
+
+    <div class="linha">
+      <div>
+        <label for="formato">Formato</label>
+        <select id="formato"></select>
+      </div>
+      <div>
+        <label for="coletanea">Juntar numa coletânea (opcional)</label>
+        <input type="text" id="coletanea" placeholder="ex.: 2000 hits" autocomplete="off">
+      </div>
+    </div>
+
+    <div style="margin-top:12px">
+      <label for="pasta">Salvar em</label>
+      <div class="pasta">
+        <input type="text" id="pasta" readonly>
+        <button class="sec" id="btnPasta">Escolher…</button>
+      </div>
+    </div>
+
+    <details>
+      <summary>Opções avançadas</summary>
+      <div class="opcoes">
+        <label><input type="checkbox" id="dryrun"> Só simular, sem baixar</label>
+        <label><input type="checkbox" id="force"> Rebaixar tudo</label>
+        <label><input type="checkbox" id="nodedup"> Não pular repetidas</label>
+        <label><input type="checkbox" id="noenrich"> Sem dados do Deezer</label>
+        <label><input type="checkbox" id="loose"> Aceitar metadado aproximado</label>
+      </div>
+      <div class="linha">
+        <div>
+          <label for="limite">Baixar só as primeiras N</label>
+          <input type="number" id="limite" min="1" placeholder="todas">
+        </div>
+        <div>
+          <label for="cookies">Playlist privada: navegador</label>
+          <select id="cookies">
+            <option value="">não usar cookies</option>
+            <option>chrome</option><option>brave</option>
+            <option>firefox</option><option>safari</option><option>edge</option>
+          </select>
+        </div>
+      </div>
+    </details>
+
+    <div class="acoes">
+      <button id="btnBaixar">Baixar</button>
+      <button class="sec oculto" id="btnParar">Parar</button>
+      <span id="status" style="font-size:13px;color:var(--fraco)"></span>
+    </div>
+    <div class="destino oculto" id="destino"></div>
+  </div>
+
+  <div class="card oculto" id="painelResumo">
+    <div class="resumo" id="resumo"></div>
+    <button class="sec" id="btnAbrir">Abrir a pasta no Finder</button>
+  </div>
+
+  <div class="card oculto" id="painelFaixas"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let jobAtual = null, fonte = null, destinoFinal = "";
+
+async function carregarConfig(){
+  const c = await (await fetch("/api/config")).json();
+  $("#formato").innerHTML = c.formatos.map(f =>
+    `<option value="${f.id}">${f.id.toUpperCase()} — ${f.nota}</option>`).join("");
+  $("#pasta").value = c.destino_padrao;
+  if(!c.ffmpeg) $("#avisoFf").classList.remove("oculto");
+}
+
+$("#btnPasta").onclick = async () => {
+  const r = await (await fetch("/api/pasta", {method:"POST"})).json();
+  if(r.pasta) $("#pasta").value = r.pasta;
+};
+
+$("#btnFf").onclick = () => {
+  $("#btnFf").disabled = true;
+  $("#barraFf").classList.remove("oculto");
+  const es = new EventSource("/api/ffmpeg/instalar");
+  es.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if(d.t === "baixando" && d.total){
+      const pct = d.feito / d.total * 100;
+      $("#barraFf i").style.width = pct + "%";
+      $("#statusFf").textContent = `${(d.feito/1e6).toFixed(0)} de ${(d.total/1e6).toFixed(0)} MB`;
+    } else if(d.t === "pronto"){
+      es.close();
+      $("#avisoFf").classList.add("oculto");
+    } else if(d.t === "erro"){
+      es.close();
+      $("#statusFf").textContent = "falhou: " + d.msg;
+      $("#btnFf").disabled = false;
+    }
+  };
+};
+
+function faixaEl(idx){
+  let el = document.getElementById("fx" + idx);
+  if(!el){
+    el = document.createElement("div");
+    el.className = "faixa"; el.id = "fx" + idx;
+    el.innerHTML = `<div class="capa"></div><div class="info">
+        <div class="nome"></div><div class="det"></div>
+        <div class="barra oculto"><i></i></div></div>
+      <span class="tag">baixando</span>`;
+    $("#painelFaixas").appendChild(el);
+  }
+  return el;
+}
+function marca(idx, texto, classe, det){
+  const el = faixaEl(idx);
+  const t = el.querySelector(".tag");
+  t.textContent = texto; t.className = "tag " + (classe || "");
+  el.querySelector(".barra").classList.add("oculto");
+  if(det !== undefined) el.querySelector(".det").textContent = det;
+}
+const mb = n => (n/1048576).toFixed(1) + " MB";
+
+function aplicar(d){
+  if(d.t === "reading") $("#status").textContent = "lendo a playlist…";
+  else if(d.t === "head"){
+    destinoFinal = d.dest;
+    $("#status").textContent = `${d.playlist} — ${d.count} faixa(s)`;
+    $("#destino").textContent = d.dest + "  ·  " + d.fmt;
+    $("#destino").classList.remove("oculto");
+    $("#painelFaixas").classList.remove("oculto");
+  }
+  else if(d.t === "present")
+    $("#status").textContent += ` · ${d.n} já na pasta`;
+  else if(d.t === "track"){
+    const el = faixaEl(d.idx);
+    el.querySelector(".nome").textContent = `${String(d.idx).padStart(2,"0")}. ${d.label}`;
+    el.scrollIntoView({block:"nearest"});
+  }
+  else if(d.t === "progress"){
+    const el = faixaEl(d.idx), b = el.querySelector(".barra");
+    if(d.pct != null){ b.classList.remove("oculto"); b.querySelector("i").style.width = d.pct + "%"; }
+    el.querySelector(".tag").textContent = d.pct != null ? d.pct + "%" : "baixando";
+  }
+  else if(d.t === "done"){
+    const el = faixaEl(d.idx);
+    const partes = [mb(d.tamanho)];
+    if(d.generos && d.generos.length) partes.push(d.generos.join("; "));
+    if(d.gravadora) partes.push(d.gravadora);
+    marca(d.idx, "pronta", "ok", partes.join(" · "));
+    if(d.capa) el.querySelector(".capa").outerHTML =
+      `<img class="capa" src="/api/capa?job=${jobAtual}&idx=${d.idx}" alt="">`;
+    if(d.nota) el.querySelector(".info").insertAdjacentHTML("beforeend",
+      `<div class="nota">${d.nota}</div>`);
+  }
+  else if(d.t === "dry"){
+    const el = faixaEl(d.idx);
+    marca(d.idx, "simulada", "", [d.artista, (d.generos||[]).join("; ") || "sem gênero"].filter(Boolean).join(" · "));
+    if(d.capa) el.querySelector(".capa").outerHTML =
+      `<img class="capa" src="/api/capa?job=${jobAtual}&idx=${d.idx}" alt="">`;
+  }
+  else if(d.t === "skipped") marca(d.idx, "já existia", "pulada", `${d.nome} · ${d.estado}`);
+  else if(d.t === "dup")     marca(d.idx, "repetida", "pulada", "já na pasta como " + d.outro);
+  else if(d.t === "orphan")  marca(d.idx, "rebaixando", "", d.outro ? "só existe como " + d.outro : "sumiu da pasta");
+  else if(d.t === "failed")  marca(d.idx, "falhou", "erro", d.motivo);
+  else if(d.t === "summary"){
+    const blocos = [["baixadas", d.baixadas], ["já na pasta", d.puladas],
+                    ["repetidas", d.repetidas], ["falharam", d.falhas],
+                    ["com capa e gênero", d.enriquecidas]];
+    $("#resumo").innerHTML = blocos.filter(b => b[1])
+      .map(([k,v]) => `<div><b>${v}</b>${k}</div>`).join("") ||
+      `<div><b>0</b>nada a fazer</div>`;
+    $("#painelResumo").classList.remove("oculto");
+    $("#status").textContent = d.dry_run ? "simulação concluída" : "concluído";
+  }
+  else if(d.t === "cancelado") $("#status").textContent = "cancelado";
+  else if(d.t === "erro"){
+    $("#status").textContent = "erro";
+    $("#painelFaixas").classList.remove("oculto");
+    $("#painelFaixas").insertAdjacentHTML("beforeend",
+      `<pre style="white-space:pre-wrap;font-size:12px;color:var(--erro);margin:8px 0 0">${d.msg}</pre>`);
+  }
+  else if(d.t === "fim") terminar();
+}
+
+function terminar(){
+  if(fonte){ fonte.close(); fonte = null; }
+  $("#btnBaixar").disabled = false;
+  $("#btnParar").classList.add("oculto");
+}
+
+$("#btnBaixar").onclick = async () => {
+  const corpo = {
+    url: $("#url").value, dest: $("#pasta").value, folder: $("#coletanea").value,
+    format: $("#formato").value, limit: $("#limite").value,
+    cookies: $("#cookies").value, dry_run: $("#dryrun").checked,
+    force: $("#force").checked, no_dedup: $("#nodedup").checked,
+    no_enrich: $("#noenrich").checked, loose: $("#loose").checked,
+  };
+  const r = await (await fetch("/api/job", {method:"POST",
+    headers:{"Content-Type":"application/json"}, body:JSON.stringify(corpo)})).json();
+  if(r.erro){ $("#status").textContent = r.erro; return; }
+
+  jobAtual = r.job;
+  $("#painelFaixas").innerHTML = "";
+  $("#painelResumo").classList.add("oculto");
+  $("#btnBaixar").disabled = true;
+  $("#btnParar").classList.remove("oculto");
+  fonte = new EventSource("/api/eventos?job=" + jobAtual);
+  fonte.onmessage = e => aplicar(JSON.parse(e.data));
+  fonte.onerror = () => terminar();
+};
+
+$("#btnParar").onclick = async () => {
+  await fetch("/api/cancelar", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({job:jobAtual})});
+  $("#status").textContent = "parando após a faixa atual…";
+};
+
+$("#btnAbrir").onclick = () => fetch("/api/abrir", {method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({caminho:destinoFinal})});
+
+carregarConfig();
+</script>
+</body>
+</html>

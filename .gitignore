@@ -8,3 +8,9 @@ Downloads/
 
 # macOS
 .DS_Store
+
+# build do launcher (gerado por osacompile)
+ytm-dl.app/
+
+# ffmpeg baixado na primeira execucao
+bin/

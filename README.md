@@ -7,6 +7,61 @@ capa em alta resolução, gênero, gravadora e ano embutidos nos arquivos.
 > permita, ou que você tenha direito de baixar. A ferramenta não verifica isso
 > por você.
 
+## Duas maneiras de usar
+
+**Interface gráfica** — para quem não usa terminal. Duplo clique em
+`ytm-dl.app`: abre uma página no navegador com campo para o link, escolha de
+formato, seletor de pasta e o progresso de cada faixa.
+
+**Linha de comando** — `ytm-dl.py`, com todas as opções. As duas usam
+exatamente o mesmo motor.
+
+---
+
+## Interface gráfica
+
+Duplo clique em **`ytm-dl.app`**. Ele sobe um servidor local, abre o navegador
+e deixa uma janelinha aberta; clicar em *Encerrar* nela desliga o servidor.
+
+O servidor escuta **apenas em `127.0.0.1`** — nada fica exposto na rede, e
+nenhum dado sai da sua máquina exceto as consultas ao YouTube e ao Deezer.
+
+### Primeira execução
+
+Se o `ffmpeg` não estiver instalado, a página mostra um aviso com um botão. Ao
+clicar, ela baixa uma build estática (~45 MB) para `bin/` dentro da pasta do
+projeto e passa a usá-la. Uma vez só, sem terminal e sem Homebrew.
+
+O binário é verificado depois do download: se vier truncado ou de outra
+arquitetura, é descartado na hora em vez de falhar na primeira conversão.
+
+### Recompilando o app
+
+O `.app` é um artefato de build e não vai no repositório. Para gerar:
+
+```bash
+osacompile -o ytm-dl.app launcher.applescript
+```
+
+O launcher descobre a pasta do projeto a partir da própria localização, então
+mova a pasta inteira à vontade — o app continua achando o resto.
+
+### Arquivos
+
+| arquivo | papel |
+|---|---|
+| `ytm-dl.py` | motor e linha de comando |
+| `server.py` | servidor local e API |
+| `web/index.html` | a página, sem dependência externa |
+| `launcher.applescript` | fonte do `.app` |
+
+O `server.py` não usa nada além da biblioteca padrão: a página conversa com ele
+por *server-sent events*, e cada acontecimento do download — faixa iniciada,
+porcentagem, pulada, repetida, concluída — chega como um evento JSON. Esse é o
+mesmo fluxo que a linha de comando imprime como texto; só muda quem desenha.
+
+---
+
 ## Instalação
 
 O `ytm-dl.py` roda num virtualenv próprio, já criado em `.venv/`:
