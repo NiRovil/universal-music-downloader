@@ -66,6 +66,7 @@ summary{cursor:pointer;font-size:13px;color:var(--fraco);user-select:none}
 .tag.ok{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
 .tag.pulada{background:color-mix(in srgb,var(--alerta) 18%,transparent);color:var(--alerta)}
 .tag.erro{background:color-mix(in srgb,var(--erro) 18%,transparent);color:var(--erro)}
+.faixa button.retry{padding:5px 11px;font-size:12px;flex:0 0 auto}
 .aviso{background:color-mix(in srgb,var(--alerta) 12%,var(--card));
        border-color:color-mix(in srgb,var(--alerta) 35%,var(--borda))}
 .resumo{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px}
@@ -213,6 +214,8 @@ function faixaEl(idx){
 }
 function marca(idx, texto, classe, det){
   const el = faixaEl(idx);
+  const antigo = el.querySelector(".retry");
+  if(antigo) antigo.remove();
   const t = el.querySelector(".tag");
   t.textContent = texto; t.className = "tag " + (classe || "");
   el.querySelector(".barra").classList.add("oculto");
@@ -220,7 +223,8 @@ function marca(idx, texto, classe, det){
 }
 const mb = n => (n/1048576).toFixed(1) + " MB";
 
-function aplicar(d){
+function aplicar(d, job){
+  job = job || jobAtual;
   if(d.t === "reading") $("#status").textContent = "lendo a playlist…";
   else if(d.t === "head"){
     destinoFinal = d.dest;
@@ -248,7 +252,7 @@ function aplicar(d){
     if(d.gravadora) partes.push(d.gravadora);
     marca(d.idx, "pronta", "ok", partes.join(" · "));
     if(d.capa) el.querySelector(".capa").outerHTML =
-      `<img class="capa" src="/api/capa?job=${jobAtual}&idx=${d.idx}" alt="">`;
+      `<img class="capa" src="/api/capa?job=${job}&idx=${d.idx}" alt="">`;
     if(d.nota) el.querySelector(".info").insertAdjacentHTML("beforeend",
       `<div class="nota">${d.nota}</div>`);
   }
@@ -256,12 +260,19 @@ function aplicar(d){
     const el = faixaEl(d.idx);
     marca(d.idx, "simulada", "", [d.artista, (d.generos||[]).join("; ") || "sem gênero"].filter(Boolean).join(" · "));
     if(d.capa) el.querySelector(".capa").outerHTML =
-      `<img class="capa" src="/api/capa?job=${jobAtual}&idx=${d.idx}" alt="">`;
+      `<img class="capa" src="/api/capa?job=${job}&idx=${d.idx}" alt="">`;
   }
   else if(d.t === "skipped") marca(d.idx, "já existia", "pulada", `${d.nome} · ${d.estado}`);
   else if(d.t === "dup")     marca(d.idx, "repetida", "pulada", "já na pasta como " + d.outro);
   else if(d.t === "orphan")  marca(d.idx, "rebaixando", "", d.outro ? "só existe como " + d.outro : "sumiu da pasta");
-  else if(d.t === "failed")  marca(d.idx, "falhou", "erro", d.motivo);
+  else if(d.t === "failed"){
+    marca(d.idx, "falhou", "erro", d.motivo);
+    const b = document.createElement("button");
+    b.className = "sec retry";
+    b.textContent = "Tentar de novo";
+    b.onclick = () => repetir(d.idx);
+    faixaEl(d.idx).appendChild(b);
+  }
   else if(d.t === "summary"){
     const blocos = [["baixadas", d.baixadas], ["já na pasta", d.puladas],
                     ["repetidas", d.repetidas], ["falharam", d.falhas],
@@ -280,6 +291,25 @@ function aplicar(d){
       `<pre style="white-space:pre-wrap;font-size:12px;color:var(--erro);margin:8px 0 0">${d.msg}</pre>`);
   }
   else if(d.t === "fim") terminar();
+}
+
+async function repetir(idx){
+  marca(idx, "tentando…", "");
+  const r = await (await fetch("/api/retentar", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({job:jobAtual, idx})})).json();
+  if(r.erro){ marca(idx, "falhou", "erro", r.erro); return; }
+  const es = new EventSource("/api/eventos?job=" + r.job);
+  es.onmessage = e => {
+    const d = JSON.parse(e.data);
+    // O job da repeticao enxerga uma playlist de uma faixa so, entao seus
+    // eventos vem como idx 1; remapeamos para a linha original da lista.
+    if(["progress","done","failed","skipped","dup"].includes(d.t))
+      aplicar({...d, idx}, r.job);
+    else if(d.t === "erro") marca(idx, "falhou", "erro", d.msg);
+    if(d.t === "fim" || d.t === "erro") es.close();
+  };
+  es.onerror = () => es.close();
 }
 
 function terminar(){

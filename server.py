@@ -109,6 +109,8 @@ class Job:
         self.id = jid
         self.eventos: queue.Queue[dict | None] = queue.Queue()
         self.capas: dict[int, bytes] = {}
+        self.urls: dict[int, str] = {}
+        self.corpo: dict = {}
         self.destino: str = ""
         self.cancelar = threading.Event()
 
@@ -135,9 +137,10 @@ def criar_emissor(ytmdl, job: Job):
             self._envia(t="present", n=n, ext=ext, next_num=next_num,
                         pooling=pooling)
 
-        def track(self, idx, total, label):
+        def track(self, idx, total, label, url):
             if job.cancelar.is_set():
                 raise KeyboardInterrupt("cancelado pelo usuario")
+            job.urls[idx] = url
             self._envia(t="track", idx=idx, total=total, label=label)
 
         def progress(self, idx, d):
@@ -198,6 +201,7 @@ def montar_args(ytmdl, corpo: dict) -> argparse.Namespace:
     """Traduz o formulario da pagina nas opcoes que o run_job espera."""
     destino = corpo.get("dest") or str(RAIZ / "Downloads")
     return argparse.Namespace(
+        index=corpo.get("index"),
         url=corpo["url"].strip(),
         dest=Path(destino).expanduser(),
         folder=(corpo.get("folder") or "").strip() or None,
@@ -224,6 +228,7 @@ def rodar_job(job: Job, corpo: dict) -> None:
         if ff:
             os.environ["YTMDL_FFMPEG"] = ff
         ytmdl = carregar_ytmdl()
+        job.corpo = corpo
         args = montar_args(ytmdl, corpo)
         ytmdl.run_job(args, criar_emissor(ytmdl, job))
     except KeyboardInterrupt:
@@ -351,6 +356,29 @@ class Handler(BaseHTTPRequestHandler):
             job = Job(jid)
             JOBS[jid] = job
             threading.Thread(target=rodar_job, args=(job, corpo),
+                             daemon=True).start()
+            return self._json({"job": jid})
+
+        if u.path == "/api/retentar":
+            dados = self._corpo_json()
+            origem = JOBS.get(dados.get("job", ""))
+            idx = int(dados.get("idx") or 0)
+            if not origem or idx not in origem.urls:
+                return self._json({"erro": "faixa desconhecida"}, 404)
+
+            # Reaproveita as opcoes do job original, trocando a playlist pela
+            # faixa unica. O destino vai como caminho absoluto em `folder`
+            # para que a pasta continue a mesma: resolvido pelo titulo, um
+            # link de faixa unica criaria uma pasta com o nome da musica.
+            # `force` fica de fora de proposito — ele apaga o historico da
+            # playlist inteira, e aqui so queremos uma faixa de volta.
+            corpo = dict(origem.corpo)
+            corpo.update(url=origem.urls[idx], folder=origem.destino,
+                         index=idx, limit=None, force=False)
+            jid = uuid.uuid4().hex[:12]
+            novo = Job(jid)
+            JOBS[jid] = novo
+            threading.Thread(target=rodar_job, args=(novo, corpo),
                              daemon=True).start()
             return self._json({"job": jid})
 

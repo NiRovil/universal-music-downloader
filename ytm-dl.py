@@ -832,7 +832,8 @@ class Emitter:
     def head(self, playlist: str, count: int, dest: Path, fmt: str,
              dry_run: bool) -> None: ...
     def present(self, n: int, ext: str, next_num: int, pooling: bool) -> None: ...
-    def track(self, idx: int, total: int, label: str) -> None: ...
+    def track(self, idx: int, total: int, label: str,
+              url: str) -> None: ...
     def progress(self, idx: int, d: dict) -> None: ...
     def skipped(self, idx: int, label: str, path: Path, estado: str) -> None: ...
     def dup(self, idx: int, label: str, other: Path) -> None: ...
@@ -864,7 +865,7 @@ class TextEmitter(Emitter):
               + (f", numerando a partir de {next_num:02d}" if pooling else ""))
         print()
 
-    def track(self, idx, total, label):
+    def track(self, idx, total, label, url):
         print(f"[{idx:02d}/{total:02d}] {label}")
 
     def progress(self, idx, d):
@@ -1062,7 +1063,7 @@ def run_job(args: argparse.Namespace, em: Emitter) -> int:
         video_url = entry.get("url") or entry.get("webpage_url") or entry.get("id")
         vid = entry.get("id") or ""
         label = entry.get("title") or video_url
-        em.track(idx, len(entries), label)
+        em.track(idx, len(entries), label, video_url)
 
         existing = None if pooling else present.get(idx)
         file_ok = (
@@ -1099,7 +1100,11 @@ def run_job(args: argparse.Namespace, em: Emitter) -> int:
         if orfa:
             em.orphan(idx, label, outro_present.get(idx), spec.ext)
 
-        out_idx = next_num if pooling else idx
+        # Ao repetir uma faixa isolada, ela precisa recuperar o proprio
+        # numero: sem isto a numeracao de pasta compartilhada a jogaria para o
+        # fim da fila, com um numero que nao e o dela.
+        forcado = getattr(args, "index", None)
+        out_idx = forcado or (next_num if pooling else idx)
         log = YtdlLogger()
         ydl_opts: dict[str, Any] = {
             **base_opts,
