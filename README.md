@@ -1,18 +1,11 @@
 # ytm-dl
 
-Baixa playlists do YouTube Music, organizadas numa pasta com o nome da
-playlist. Duas ferramentas no mesmo diretório:
-
-| | o que faz | quando usar |
-|---|---|---|
-| **`ytm-dl.py`** | FLAC com capa, gênero, gravadora e ano | padrão — use esta |
-| `ytm-dl` | WAV simples, sem metadados externos | quando algo exigir PCM puro e nada mais |
+Baixa playlists do YouTube Music em sete formatos, organizadas por pasta, com
+capa em alta resolução, gênero, gravadora e ano embutidos nos arquivos.
 
 > **Uso legal:** baixe apenas faixas livres de copyright, sob licença que
 > permita, ou que você tenha direito de baixar. A ferramenta não verifica isso
 > por você.
-
----
 
 ## Instalação
 
@@ -20,12 +13,14 @@ O `ytm-dl.py` roda num virtualenv próprio, já criado em `.venv/`:
 
 ```bash
 python3 -m venv .venv
-./.venv/bin/pip install yt-dlp mutagen
+./.venv/bin/pip install -r requirements.txt
 ```
 
-Também precisa do `ffmpeg` no sistema: `brew install ffmpeg`.
+Também precisa do `ffmpeg` no sistema, que faz toda a conversão de áudio:
 
-O script bash usa o `yt-dlp` do sistema (`brew install yt-dlp`).
+```bash
+brew install ffmpeg
+```
 
 ### Um atalho que vale a pena
 
@@ -93,7 +88,8 @@ Cada arquivo carrega:
 | `-j N` | fragmentos simultâneos por faixa | `4` |
 | `-c NAV` | cookies do navegador (playlists privadas) | — |
 | `-f` | ignora o histórico e rebaixa tudo | — |
-| `--format flac\|wav` | formato de saída | `flac` |
+| `--format FMT` | formato de saída (ver tabela abaixo) | `flac` |
+| `--bitrate K` | kbps nos formatos com perdas | `320` mp3, `256` m4a |
 | `--bits 16\|24` | profundidade | `16` |
 | `--rate HZ` | reamostra | mantém os 48000 Hz da fonte |
 | `--no-enrich` | não consulta o Deezer | — |
@@ -261,31 +257,62 @@ histórico só complementa.
 Uma faixa indisponível não derruba o resto: o script segue e lista a falha no
 relatório, separada das que já existiam.
 
-## Sobre o formato
+## Formatos de saída
 
-O YouTube entrega áudio comprimido — na prática Opus a ~160 kbps, 48 kHz. O
-FLAC guarda exatamente o que o Opus decodificou, sem perda adicional, em cerca
-de **60% do tamanho de um WAV** equivalente.
+```bash
+... ytm-dl.py --format aiff '<link>'
+... ytm-dl.py --format mp3 --bitrate 256 '<link>'
+```
+
+Medido numa faixa de 2 min 41 s, todos com capa 1000×1000 e gênero embutidos:
+
+| `--format` | arquivo | tamanho | codec | perdas | para quê |
+|---|---|---|---|---|---|
+| **`flac`** (padrão) | `.flac` | 17,9 MB | FLAC 16/48 | não | uso geral; tags e capa nativas |
+| `alac` | `.m4a` | 18,4 MB | ALAC 16/48 | não | mesmo áudio, para o ecossistema Apple |
+| `wav` | `.wav` | 31,0 MB | PCM 16 LE | não | quando algo exige PCM cru |
+| `aiff` | `.aiff` | 31,0 MB | PCM 16 BE | não | PCM no formato que o Rekordbox prefere |
+| `mp3` | `.mp3` | 6,6 MB | MP3 320 kbps | sim | compatibilidade com qualquer coisa |
+| `m4a` | `.m4a` | 5,5 MB | AAC 256 kbps | sim | metade do MP3, qualidade semelhante |
+| `opus` | `.opus` | 2,7 MB | Opus ~160 kbps | — | o áudio original, sem reconversão |
+
+### Como escolher
+
+O YouTube entrega **Opus a ~160 kbps, 48 kHz** — já comprimido com perdas.
+Tudo na tabela parte daí, e isso decide a escolha:
+
+- **`opus`** é o único que não reconverte nada: copia o que o YouTube serviu.
+  É o menor arquivo e, tecnicamente, o mais fiel à fonte. Perde em
+  compatibilidade — muito equipamento de DJ e player antigo não abre.
+- **`flac`, `alac`, `wav`, `aiff`** guardam sem perda adicional o que o Opus
+  decodificou. Não recuperam qualidade que não existe, mas entregam PCM ou
+  lossless, que é o que DAW, sampler e software de DJ costumam exigir.
+- **`mp3` e `m4a`** são reconversão de lossy para lossy, com perda em cima de
+  perda. Use quando compatibilidade importar mais que fidelidade.
 
 O padrão é **16 bits, 48 kHz**, e os dois números têm motivo:
 
 - **16 bits** porque o Opus decodifica em float e, deixado por conta própria, o
-  ffmpeg deduz 24 bits — o FLAC sairia com 31,5 MB contra 28,3 MB do WAV, maior
-  que o formato não comprimido e sem nenhum ganho: a fonte é lossy.
+  ffmpeg deduz 24 bits — o FLAC sairia maior que o WAV, sem nenhum ganho: a
+  fonte é lossy. `--bits 24` existe se algum fluxo seu exigir.
 - **48 kHz**, a taxa nativa da fonte. Reamostrar para 44,1 kHz é uma conversão
-  a mais sem benefício. Se algum equipamento seu exigir 44,1, use `--rate 44100`.
+  a mais sem benefício; use `--rate 44100` só se o equipamento exigir.
 
-### E o WAV?
+### Onde a capa fica em cada um
 
-WAV não suporta capa: o muxer do ffmpeg recusa qualquer imagem, e o próprio
-yt-dlp responde que os formatos com capa são `mp3, mkv/mka, ogg/opus/flac,
-m4a/mp4/m4v/mov`. Com `--format wav` o script contorna gravando um chunk ID3v2
-via mutagen — funciona, mas o suporte entre players é irregular (foobar2000 lê,
-Music.app e Finder ignoram) e o arquivo fica com duas camadas de tag.
+Os quatro esquemas de metadados que os sete formatos usam:
 
-Se precisa de WAV, prefira gerar FLAC e converter na hora do uso.
+| esquema | formatos | capa |
+|---|---|---|
+| Vorbis comments | `flac` | bloco de imagem nativo |
+| Vorbis comments | `opus` | bloco FLAC serializado em base64 |
+| ID3v2 | `mp3`, `wav`, `aiff` | frame `APIC` |
+| átomos MP4 | `alac`, `m4a` | átomo `covr` |
 
----
+Em `wav` e `aiff` o ID3 é um chunk enfiado dentro do container — funciona
+(Rekordbox lê), mas nem todo player procura ali. O Finder do macOS não mostra
+miniatura de `flac` nem de `opus`: é limitação do QuickLook, não do arquivo. Se
+a capa visível no Finder importa, use `m4a` ou `mp3`.
 
 ## Quando dá errado
 
@@ -308,16 +335,3 @@ comercial; é limitação da fonte, não do script.
 `./.venv/bin/pip install -U yt-dlp`.
 
 ---
-
-## O script bash (`ytm-dl`)
-
-Versão anterior, mantida por ser simples e não depender do venv. Só WAV, sem
-capa e sem gênero:
-
-```bash
-~/Documents/ytm-dl/ytm-dl -n 3 '<link>'
-```
-
-Flags: `-o DIR`, `-j N`, `-c NAV`, `-r HZ`, `-b pcm_s16le|pcm_s24le|pcm_f32le`,
-`-1` (mono), `-n N`, `-f`, `-h`. O padrão dele é 16 bits **44,1 kHz**, diferente
-do Python.

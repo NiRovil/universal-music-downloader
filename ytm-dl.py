@@ -13,8 +13,10 @@ Uso:  ytm-dl.py [opcoes] <link do music.youtube.com>
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
+import subprocess
 import sys
 import time
 import unicodedata
@@ -27,8 +29,13 @@ from urllib.request import Request, urlopen
 
 try:
     import yt_dlp
+    from mutagen import File as MutagenFile
+    from mutagen.aiff import AIFF
     from mutagen.flac import FLAC, Picture
     from mutagen.id3 import APIC, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TRCK
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4, MP4Cover
+    from mutagen.oggopus import OggOpus
     from mutagen.wave import WAVE
 except ImportError as exc:  # pragma: no cover
     sys.exit(
@@ -44,6 +51,40 @@ UA = "ytm-dl/2.0 (uso pessoal)"
 DURATION_TOLERANCE = 3  # segundos, ao casar no Deezer
 DUP_TOLERANCE = 5       # segundos, ao considerar duas faixas a mesma musica
 NET_TIMEOUT = 15
+
+
+@dataclass(frozen=True)
+class Fmt:
+    """Como produzir e etiquetar um formato de saida."""
+
+    ext: str        # extensao em disco
+    codec: str      # o que pedir ao FFmpegExtractAudio do yt-dlp
+    lossless: bool
+    tagger: str     # 'vorbis' | 'id3' | 'mp4'
+    quality: str = ""   # kbps, so para os com perdas
+    nota: str = ""
+
+
+FORMATS: dict[str, Fmt] = {
+    # sem perdas
+    "flac": Fmt("flac", "flac", True, "vorbis",
+                nota="padrao: sem perdas, tags e capa nativas"),
+    "alac": Fmt("m4a", "alac", True, "mp4",
+                nota="sem perdas da Apple; toca no Music.app"),
+    "wav":  Fmt("wav", "wav", True, "id3",
+                nota="PCM cru; capa so via chunk ID3, suporte irregular"),
+    "aiff": Fmt("aiff", "wav", True, "id3",
+                nota="PCM big-endian; formato preferido do Rekordbox"),
+    # com perdas
+    "mp3":  Fmt("mp3", "mp3", False, "id3", "320",
+                nota="320 kbps; o mais compativel que existe"),
+    "m4a":  Fmt("m4a", "m4a", False, "mp4", "256",
+                nota="AAC 256 kbps"),
+    "opus": Fmt("opus", "opus", False, "vorbis",
+                nota="o proprio audio do YouTube, sem reconversao"),
+}
+
+AUDIO_EXTS = tuple(sorted({f".{f.ext}" for f in FORMATS.values()}))
 
 # --------------------------------------------------------------------- util ---
 
@@ -260,35 +301,70 @@ def enrich(meta: Meta, duration: float, want_cover: bool,
 # ------------------------------------------------------------------ tagging ---
 
 
-def tag_flac(path: Path, meta: Meta, index: int) -> None:
-    f = FLAC(str(path))
-    f.delete()
-    f["title"] = meta.title
-    f["artist"] = meta.artist
-    f["album"] = meta.album or meta.title
-    f["tracknumber"] = str(index)
+def _jpeg_size(data: bytes) -> tuple[int, int]:
+    """Largura/altura lidas dos marcadores SOFn do JPEG (0x0 se nao achar)."""
+    i = 2
+    while i < len(data) - 9:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6,
+                      0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            h = int.from_bytes(data[i + 5:i + 7], "big")
+            w = int.from_bytes(data[i + 7:i + 9], "big")
+            return w, h
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    return 0, 0
+
+
+def _picture(cover: bytes) -> Picture:
+    pic = Picture()
+    pic.type = 3  # front cover
+    pic.mime = "image/jpeg"
+    pic.desc = "Cover"
+    pic.data = cover
+    pic.width, pic.height = _jpeg_size(cover)
+    pic.depth = 24
+    return pic
+
+
+def tag_vorbis(path: Path, meta: Meta, index: int, fmt: str) -> None:
+    """FLAC e Opus: comentarios Vorbis."""
+    a = FLAC(str(path)) if fmt == "flac" else OggOpus(str(path))
+    a["title"] = meta.title
+    a["artist"] = meta.artist
+    a["album"] = meta.album or meta.title
+    a["tracknumber"] = str(index)
     if meta.albumartist:
-        f["albumartist"] = meta.albumartist
+        a["albumartist"] = meta.albumartist
     if meta.date:
-        f["date"] = meta.date
+        a["date"] = meta.date
     if meta.genres:
-        f["genre"] = meta.genres
+        a["genre"] = meta.genres
     if meta.label:
-        f["organization"] = meta.label
+        a["organization"] = meta.label
     if meta.cover:
-        f.clear_pictures()
-        pic = Picture()
-        pic.type = 3  # front cover
-        pic.mime = "image/jpeg"
-        pic.desc = "Cover"
-        pic.data = meta.cover
-        f.add_picture(pic)
-    f.save()
+        pic = _picture(meta.cover)
+        if fmt == "flac":
+            a.clear_pictures()
+            a.add_picture(pic)
+        else:
+            # Opus nao tem bloco de imagem proprio: vai um Picture do FLAC
+            # serializado em base64, que e a convencao do formato.
+            a["metadata_block_picture"] = [
+                base64.b64encode(pic.write()).decode("ascii")
+            ]
+    a.save()
 
 
-def tag_wav(path: Path, meta: Meta, index: int) -> None:
-    """WAV nao tem suporte nativo a capa; usamos um chunk ID3v2."""
-    a = WAVE(str(path))
+def tag_id3(path: Path, meta: Meta, index: int, fmt: str) -> None:
+    """MP3, WAV e AIFF: ID3v2. Nos dois ultimos e um chunk dentro do RIFF/IFF."""
+    opener = {"mp3": MP3, "wav": WAVE, "aiff": AIFF}[fmt]
+    a = opener(str(path))
     if a.tags is None:
         a.add_tags()
     a.tags.delall("APIC")
@@ -303,8 +379,53 @@ def tag_wav(path: Path, meta: Meta, index: int) -> None:
     if meta.genres:
         a.tags.add(TCON(encoding=3, text="; ".join(meta.genres)))
     if meta.cover:
-        a.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=meta.cover))
+        a.tags.add(APIC(encoding=3, mime="image/jpeg", type=3,
+                        desc="Cover", data=meta.cover))
     a.save()
+
+
+def tag_mp4(path: Path, meta: Meta, index: int, fmt: str) -> None:
+    """ALAC e AAC: atomos do container MP4."""
+    a = MP4(str(path))
+    a["\xa9nam"] = [meta.title]
+    a["\xa9ART"] = [meta.artist]
+    a["\xa9alb"] = [meta.album or meta.title]
+    a["trkn"] = [(index, 0)]
+    if meta.albumartist:
+        a["aART"] = [meta.albumartist]
+    if meta.date:
+        a["\xa9day"] = [meta.date]
+    if meta.genres:
+        a["\xa9gen"] = ["; ".join(meta.genres)]
+    if meta.cover:
+        a["covr"] = [MP4Cover(meta.cover, imageformat=MP4Cover.FORMAT_JPEG)]
+    a.save()
+
+
+TAGGERS = {"vorbis": tag_vorbis, "id3": tag_id3, "mp4": tag_mp4}
+
+
+def tag_file(path: Path, meta: Meta, index: int, fmt: str) -> None:
+    TAGGERS[FORMATS[fmt].tagger](path, meta, index, fmt)
+
+
+def to_aiff(src: Path, bits: int, rate: int | None) -> Path:
+    """
+    Converte o WAV recem-gerado em AIFF.
+
+    O yt-dlp nao produz AIFF (aceita aac, alac, flac, m4a, mp3, opus, vorbis e
+    wav), entao pedimos WAV e trocamos o container aqui. AIFF usa PCM
+    big-endian — dai o `be` no codec.
+    """
+    out = src.with_suffix(".aiff")
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src),
+           "-acodec", "pcm_s16be" if bits == 16 else "pcm_s24be", "-ac", "2"]
+    if rate:
+        cmd += ["-ar", str(rate)]
+    cmd.append(str(out))
+    subprocess.run(cmd, check=True, capture_output=True)
+    src.unlink()
+    return out
 
 
 # ----------------------------------------------------------------- download ---
@@ -333,6 +454,17 @@ def scan_dest(dest: Path, ext: str) -> dict[int, Path]:
     return found
 
 
+def scan_other_formats(dest: Path, ext: str) -> dict[int, Path]:
+    """Mesmo indice, porem em outro formato de audio."""
+    found: dict[int, Path] = {}
+    for other in AUDIO_EXTS:
+        if other == f".{ext.lower()}":
+            continue
+        for k, v in scan_dest(dest, other.lstrip(".")).items():
+            found.setdefault(k, v)
+    return found
+
+
 def read_archive(archive: Path) -> set[str]:
     """Ids ja registrados no historico ('youtube <id>' por linha)."""
     ids: set[str] = set()
@@ -342,6 +474,161 @@ def read_archive(archive: Path) -> set[str]:
             if len(parts) >= 2:
                 ids.add(parts[1])
     return ids
+
+
+@dataclass
+class LibEntry:
+    """Uma faixa que ja esta na pasta, identificada pelo conteudo."""
+
+    path: Path
+    title: str
+    artist: str
+    duration: float
+
+
+def read_basic_tags(path: Path) -> tuple[str, str, float]:
+    """
+    Titulo, artista e duracao de qualquer um dos formatos suportados.
+
+    A interface `easy` do mutagen cobre FLAC, MP3, MP4 e Opus, mas nao WAV nem
+    AIFF: nesses dois ela devolve os frames ID3 crus, e `get("title")` volta
+    vazio. Dai a leitura direta de TIT2/TPE1 como reserva — sem ela o dedupe
+    perderia o artista justamente nos formatos de PCM.
+    """
+    title = artist = ""
+    duration = 0.0
+    try:
+        easy = MutagenFile(str(path), easy=True)
+        if easy is not None:
+            title = (easy.get("title") or [""])[0]
+            artist = (easy.get("artist") or [""])[0]
+            duration = float(easy.info.length)
+    except Exception:
+        pass
+    if not title or not artist:
+        try:
+            audio = MutagenFile(str(path))
+            tags = getattr(audio, "tags", None)
+            if tags is not None and hasattr(tags, "getall"):
+                if not title:
+                    fr = tags.getall("TIT2")
+                    title = fr[0].text[0] if fr else ""
+                if not artist:
+                    fr = tags.getall("TPE1")
+                    artist = fr[0].text[0] if fr else ""
+            if not duration and audio is not None:
+                duration = float(audio.info.length)
+        except Exception:
+            pass
+    return title, artist, duration
+
+
+def index_library(dest: Path, ext: str) -> list[LibEntry]:
+    """
+    Le titulo/artista/duracao de tudo que ja existe na pasta.
+
+    Le as tags, nao o nome do arquivo: ao juntar varias playlists numa
+    coletanea, a mesma musica chega com numeracao e ate nome diferentes.
+    """
+    out: list[LibEntry] = []
+    if not dest.is_dir():
+        return out
+    for f in sorted(dest.iterdir()):
+        if not f.is_file() or f.suffix.lower() != f".{ext.lower()}":
+            continue
+        title, artist, duration = read_basic_tags(f)
+        if not title:  # sem tags legiveis, o nome do arquivo serve
+            title = re.sub(r"^\d+\s*-\s*", "", f.stem)
+        out.append(LibEntry(f, title, artist, duration))
+    return out
+
+
+def find_duplicate(
+    library: list[LibEntry], title: str, artist: str, duration: float,
+) -> LibEntry | None:
+    """
+    Acha a mesma musica ja presente na pasta.
+
+    Titulo semelhante E duracao proxima. A duracao e o que separa a faixa de
+    uma extended mix ou de um remix homonimo, que sao arquivos diferentes e
+    voce provavelmente quer os dois. O artista, quando conhecido dos dois
+    lados, precisa bater tambem — senao covers seriam descartados como copia.
+    """
+    nt, na = norm(title), norm(artist)
+    if not nt:
+        return None
+    for e in library:
+        et, ea = norm(e.title), norm(e.artist)
+        if not (et and (et in nt or nt in et)):
+            continue
+        if duration and e.duration and abs(e.duration - duration) > DUP_TOLERANCE:
+            continue
+        if na and ea and not (ea in na or na in ea):
+            continue
+        return e
+    return None
+
+
+def titles_match(path: Path, title: str) -> bool:
+    """O arquivo no indice N e mesmo esta faixa? (playlist pode ter mudado)"""
+    if not title:
+        return True
+    stem = re.sub(r"^\d+\s*-\s*", "", path.stem)
+    a, b = norm(stem), norm(title)
+    return bool(a and b) and (a in b or b in a)
+
+
+def _has_cover(audio: Any) -> bool:
+    """Capa embutida, em qualquer um dos quatro esquemas que usamos."""
+    if audio is None:
+        return False
+    if getattr(audio, "pictures", None):        # FLAC
+        return True
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return False
+    try:
+        if hasattr(tags, "getall") and tags.getall("APIC"):   # ID3
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(tags.get("covr") or tags.get("metadata_block_picture"))
+    except Exception:
+        return False
+
+
+def _read_genre(audio: Any) -> str:
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return ""
+    try:
+        if hasattr(tags, "getall"):
+            frames = tags.getall("TCON")                      # ID3
+            if frames:
+                return "; ".join(frames[0].text)
+    except Exception:
+        pass
+    for key in ("genre", "\xa9gen"):                          # Vorbis / MP4
+        try:
+            v = tags.get(key)
+        except Exception:
+            v = None
+        if v:
+            return "; ".join(str(x) for x in v)
+    return ""
+
+
+def inspect_existing(path: Path) -> str:
+    """Resumo do que o arquivo ja carrega — so leitura local, sem rede."""
+    try:
+        audio = MutagenFile(str(path))
+    except Exception:
+        return "nao consegui ler as tags"
+    if audio is None:
+        return "formato nao reconhecido"
+    genre = _read_genre(audio)
+    return f"{'capa' if _has_cover(audio) else 'sem capa'} | {genre or 'sem genero'}"
 
 
 @dataclass
@@ -496,8 +783,13 @@ def main() -> int:
                    help="ler cookies do navegador (chrome, brave, firefox, safari, edge)")
     p.add_argument("-f", "--force", action="store_true",
                    help="ignora o historico e rebaixa tudo")
-    p.add_argument("--format", choices=("flac", "wav"), default="flac",
-                   help="formato de saida (padrao: flac)")
+    p.add_argument("--format", choices=tuple(FORMATS), default="flac",
+                   metavar="FMT",
+                   help="formato de saida (padrao: flac). Opcoes: "
+                        + ", ".join(f"{k} ({v.nota})" for k, v in FORMATS.items()))
+    p.add_argument("--bitrate", metavar="K",
+                   help="kbps para os formatos com perdas"
+                        " (padrao: 320 no mp3, 256 no m4a)")
     p.add_argument("--bits", type=int, choices=(16, 24), default=16,
                    help="profundidade de bits (padrao: 16)")
     p.add_argument("--rate", type=int, metavar="HZ",
@@ -516,6 +808,7 @@ def main() -> int:
                    help="mostra o que seria baixado e etiquetado, sem baixar")
     args = p.parse_args()
 
+    spec = FORMATS[args.format]
     base_opts: dict[str, Any] = {"quiet": True, "no_warnings": True}
     if args.cookies:
         base_opts["cookiesfrombrowser"] = (args.cookies,)
@@ -540,8 +833,13 @@ def main() -> int:
     print(f"-> playlist : {playlist_title}")
     print(f"-> faixas   : {len(entries)}")
     print(f"-> destino  : {dest}")
-    print(f"-> formato  : {args.format.upper()} {args.bits} bits"
-          f" {args.rate or 48000} Hz"
+    if spec.lossless:
+        detalhe = (f"{args.bits} bits {args.rate or 48000} Hz"
+                   if spec.codec in ("wav", "flac", "alac") else "")
+    else:
+        detalhe = (f"{args.bitrate or spec.quality} kbps" if spec.quality
+                   else "copia direta da fonte")
+    print(f"-> formato  : .{spec.ext} ({args.format}) {detalhe}"
           f"{'' if args.no_enrich else ' + metadados do Deezer'}")
     if args.dry_run:
         print("-> DRY RUN  : nada sera baixado")
@@ -554,18 +852,17 @@ def main() -> int:
 
     # Verificacao previa: o que ja esta na pasta nao volta a ser baixado nem
     # consultado no Deezer — vale inclusive para --dry-run.
-    present = scan_dest(dest, args.format)
-    outro_fmt = "wav" if args.format == "flac" else "flac"
-    outro_present = scan_dest(dest, outro_fmt)
+    present = scan_dest(dest, spec.ext)
+    outro_present = scan_other_formats(dest, spec.ext)
     archive_ids = set() if args.force else read_archive(archive)
-    library = [] if args.no_dedup else index_library(dest, args.format)
+    library = [] if args.no_dedup else index_library(dest, spec.ext)
 
     # Numa pasta compartilhada a posicao na playlist nao serve de nome: a
     # numeracao continua de onde a pasta parou.
     next_num = (max(present) if present else 0) + 1
 
     if present:
-        print(f"-> ja na pasta: {len(present)} arquivo(s) .{args.format}"
+        print(f"-> ja na pasta: {len(present)} arquivo(s) .{spec.ext}"
               + (f", numerando a partir de {next_num:02d}" if pooling else ""))
         print()
 
@@ -612,8 +909,8 @@ def main() -> int:
         if orfa:
             outro = outro_present.get(idx)
             if outro:
-                print(f"        ! so existe em .{outro_fmt} ({outro.name})"
-                      f" — gerando .{args.format}")
+                print(f"        ! so existe em {outro.suffix} ({outro.name})"
+                      f" — gerando .{spec.ext}")
             else:
                 print("        ! no historico, mas ausente da pasta — rebaixando")
 
@@ -628,19 +925,28 @@ def main() -> int:
             "ignoreerrors": True,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": args.format,
-                "preferredquality": "0",
+                "preferredcodec": spec.codec,
+                "preferredquality": args.bitrate or spec.quality or "0",
             }],
         }
         pp_args: list[str] = []
-        if args.format == "flac":
+        if spec.codec == "flac":
             # Sem fixar isto, o ffmpeg deduz 24 bits do float que o Opus
             # decodifica e o FLAC sai MAIOR que o WAV (31,5 vs 28,3 MB numa
             # faixa de 2:40) sem ganho algum: a fonte e lossy.
             pp_args += ["-sample_fmt", "s16" if args.bits == 16 else "s32"]
-        else:
-            pp_args += ["-acodec", "pcm_s16le" if args.bits == 16 else "pcm_s24le", "-ac", "2"]
-        if args.rate:
+        elif spec.codec == "wav":
+            pp_args += ["-acodec",
+                        "pcm_s16le" if args.bits == 16 else "pcm_s24le", "-ac", "2"]
+        elif spec.codec == "alac":
+            # O -acodec explicito nao e redundante: o yt-dlp registra o alac com
+            # acodec=None e depois sobrescreve more_opts com os args de
+            # qualidade, descartando o proprio "-acodec alac". Sem isto o .m4a
+            # sai como AAC lossy, com nome de formato sem perdas.
+            pp_args += ["-acodec", "alac",
+                        "-sample_fmt", "s16p" if args.bits == 16 else "s32p"]
+        # Opus so existe a 48 kHz; reamostrar aqui so estragaria a copia direta.
+        if args.rate and spec.codec != "opus":
             pp_args += ["-ar", str(args.rate)]
         ydl_opts["postprocessor_args"] = {"extractaudio": pp_args}
         if args.force or orfa:
@@ -676,7 +982,7 @@ def main() -> int:
             # O yt-dlp nao produziu arquivo. Antes isto virava "falhou ao
             # baixar", o que era falso: quase sempre a faixa ja estava em
             # disco. Conferimos a pasta antes de acusar qualquer coisa.
-            achado = scan_dest(dest, args.format).get(idx)
+            achado = scan_dest(dest, spec.ext).get(idx)
             if achado:
                 estado = inspect_existing(achado)
                 print(f"        = ja baixada: {achado.name}"
@@ -707,11 +1013,17 @@ def main() -> int:
             report.append((idx, label, meta, ""))
             continue
 
+        if args.format == "aiff" and path.suffix.lower() == ".wav":
+            try:
+                path = to_aiff(path, args.bits, args.rate)
+            except subprocess.CalledProcessError as exc:
+                erro = (exc.stderr or b"").decode(errors="replace").strip()
+                print(f"        x falhou ao converter para AIFF: {erro[:120]}\n")
+                failed.append((idx, label, "conversao para AIFF falhou"))
+                continue
+
         try:
-            if args.format == "flac":
-                tag_flac(path, meta, out_idx)
-            else:
-                tag_wav(path, meta, out_idx)
+            tag_file(path, meta, out_idx, args.format)
             tag_err = ""
         except Exception as exc:  # tagging nunca deve perder o download
             tag_err = f"tags falharam: {exc}"
