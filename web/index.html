@@ -124,6 +124,7 @@ summary{cursor:pointer;font-size:13px;color:var(--fraco);user-select:none}
         <label><input type="checkbox" id="dryrun"> Só simular, sem baixar</label>
         <label><input type="checkbox" id="force"> Rebaixar tudo</label>
         <label><input type="checkbox" id="nodedup"> Não pular repetidas</label>
+        <label><input type="checkbox" id="nocover"> Não embutir capa</label>
         <label><input type="checkbox" id="noenrich"> Sem dados do Deezer</label>
         <label><input type="checkbox" id="loose"> Aceitar metadado aproximado</label>
       </div>
@@ -293,7 +294,8 @@ $("#btnBaixar").onclick = async () => {
     format: $("#formato").value, limit: $("#limite").value,
     cookies: $("#cookies").value, dry_run: $("#dryrun").checked,
     force: $("#force").checked, no_dedup: $("#nodedup").checked,
-    no_enrich: $("#noenrich").checked, loose: $("#loose").checked,
+    no_enrich: $("#noenrich").checked, no_cover: $("#nocover").checked,
+    loose: $("#loose").checked,
   };
   const r = await (await fetch("/api/job", {method:"POST",
     headers:{"Content-Type":"application/json"}, body:JSON.stringify(corpo)})).json();

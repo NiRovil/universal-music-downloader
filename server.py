@@ -211,7 +211,7 @@ def montar_args(ytmdl, corpo: dict) -> argparse.Namespace:
         force=bool(corpo.get("force")),
         no_dedup=bool(corpo.get("no_dedup")),
         no_enrich=bool(corpo.get("no_enrich")),
-        no_cover=False,
+        no_cover=bool(corpo.get("no_cover")),
         tolerance=ytmdl.DURATION_TOLERANCE,
         loose=bool(corpo.get("loose")),
         dry_run=bool(corpo.get("dry_run")),

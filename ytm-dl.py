@@ -935,7 +935,11 @@ class TextEmitter(Emitter):
                   " (puladas)")
         if d["novas"]:
             verbo = "seriam baixadas" if d["dry_run"] else "baixadas agora"
-            extra = "" if d["no_enrich"] else f" | {d['rich']} com genero/capa do Deezer"
+            if d["no_enrich"]:
+                extra = ""
+            else:
+                o_que = "genero" if d.get("no_cover") else "genero/capa"
+                extra = f" | {d['rich']} com {o_que} do Deezer"
             print(f"  {len(d['novas']):>3} {verbo}{extra}")
         if d["failed"]:
             print(f"  {len(d['failed']):>3} falharam")
@@ -1221,6 +1225,7 @@ def run_job(args: argparse.Namespace, em: Emitter) -> int:
         "dest": dest,
         "dry_run": args.dry_run,
         "no_enrich": args.no_enrich,
+        "no_cover": args.no_cover,
         "skipped": skipped,
         "dups": dups,
         "failed": failed,
