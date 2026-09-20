@@ -1,0 +1,10 @@
+# ambiente virtual (recriável via requirements.txt)
+.venv/
+__pycache__/
+*.pyc
+
+# saída de áudio — nunca versionar downloads
+Downloads/
+
+# macOS
+.DS_Store

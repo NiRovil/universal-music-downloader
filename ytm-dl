@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+#
+# ytm-dl — baixa playlists do YouTube Music em WAV
+#
+# Uso:  ytm-dl [opções] <link do music.youtube.com>
+#
+# Salva em:  <pasta do script>/Downloads/<Nome da Playlist>/NN - Faixa.wav
+#
+# ATENÇÃO: use apenas com conteúdo livre de copyright ou que você
+# tenha direito de baixar.
+
+set -Eeuo pipefail
+
+# ---------------------------------------------------------------- padrões ---
+# resolve o caminho real do script (mesmo chamado por symlink)
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  _t="$(readlink "$SELF")"
+  [[ "$_t" == /* ]] && SELF="$_t" || SELF="$(cd "$(dirname "$SELF")" && pwd)/$_t"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+DEST_BASE="${SCRIPT_DIR}/Downloads"
+JOBS=4
+COOKIES_BROWSER=""
+FORCE=0
+MAX_ITEMS=""
+SAMPLE_RATE=44100
+CHANNELS=2
+BITDEPTH="pcm_s16le"
+
+usage() {
+  cat <<'USAGE'
+ytm-dl — baixa playlists do YouTube Music em WAV
+
+Uso:
+  ytm-dl [opções] <url>
+
+Opções:
+  -o DIR      pasta base de destino          (padrão: ~/Documents/ytm-dl/Downloads)
+  -j N        downloads simultâneos          (padrão: 4)
+  -c NAV      ler cookies do navegador para playlists privadas
+              (chrome, brave, firefox, safari, edge...)
+  -r HZ       sample rate do WAV             (padrão: 44100)
+  -b FMT      profundidade: pcm_s16le | pcm_s24le | pcm_f32le  (padrão: pcm_s16le)
+  -1          mono (padrão: estéreo)
+  -n N        baixa só as N primeiras faixas (teste)
+  -f          ignora o histórico e rebaixa tudo
+  -h          esta ajuda
+
+Exemplos:
+  ytm-dl 'https://music.youtube.com/playlist?list=PLxxxxxxxx'
+  ytm-dl -b pcm_s24le -r 48000 'https://music.youtube.com/playlist?list=PLxxxxxxxx'
+  ytm-dl -c chrome 'https://music.youtube.com/playlist?list=LM'
+USAGE
+}
+
+while getopts ":o:j:c:r:b:n:1fh" opt; do
+  case "$opt" in
+    o) DEST_BASE="$OPTARG" ;;
+    j) JOBS="$OPTARG" ;;
+    c) COOKIES_BROWSER="$OPTARG" ;;
+    r) SAMPLE_RATE="$OPTARG" ;;
+    b) BITDEPTH="$OPTARG" ;;
+    1) CHANNELS=1 ;;
+    n) MAX_ITEMS="$OPTARG" ;;
+    f) FORCE=1 ;;
+    h) usage; exit 0 ;;
+    \?) echo "opção inválida: -$OPTARG" >&2; usage >&2; exit 2 ;;
+    :)  echo "opção -$OPTARG exige um valor" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+URL="${1:-}"
+if [[ -z "$URL" ]]; then
+  echo "erro: informe o link da playlist." >&2
+  echo >&2
+  usage >&2
+  exit 2
+fi
+
+# ------------------------------------------------------------ dependências ---
+missing=()
+command -v yt-dlp >/dev/null 2>&1 || missing+=("yt-dlp")
+command -v ffmpeg >/dev/null 2>&1 || missing+=("ffmpeg")
+if (( ${#missing[@]} )); then
+  echo "erro: faltando: ${missing[*]}" >&2
+  echo "instale com:  brew install ${missing[*]}" >&2
+  exit 1
+fi
+
+# ------------------------------------------------------ opções compartilhadas -
+COMMON=(--no-warnings)
+[[ -n "$MAX_ITEMS" ]] && COMMON+=(--playlist-items "1:${MAX_ITEMS}")
+[[ -n "$COOKIES_BROWSER" ]] && COMMON+=(--cookies-from-browser "$COOKIES_BROWSER")
+
+# --------------------------------------------- descobrir o nome da playlist ---
+echo "→ lendo a playlist..."
+
+# uma única consulta: título + id de cada faixa (sem baixar nada)
+set +e
+PROBE="$(
+  yt-dlp "${COMMON[@]}" --flat-playlist \
+    --print '%(playlist_title|Playlist sem nome)s' -- "$URL" 2>&1
+)"
+probe_rc=$?
+set -e
+
+if (( probe_rc != 0 )) || [[ -z "$PROBE" ]]; then
+  echo >&2
+  echo "erro: não consegui ler essa playlist." >&2
+  printf '%s\n' "$PROBE" | grep -iE '^ERROR' | head -3 | sed 's/^/  /' >&2
+  echo >&2
+  echo "verifique:" >&2
+  echo "  • o link está completo? o id depois de 'list=' costuma ter ~34 caracteres" >&2
+  echo "    (ex.: list=PLxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx)" >&2
+  echo "  • a playlist é pública? se for privada ou sua biblioteca, use -c <navegador>" >&2
+  echo "    ex.: ytm-dl -c chrome '<link>'" >&2
+  exit 1
+fi
+
+PLAYLIST_TITLE="$(printf '%s\n' "$PROBE" | head -n1)"
+TRACK_COUNT="$(printf '%s\n' "$PROBE" | wc -l | tr -d ' ')"
+[[ -z "$PLAYLIST_TITLE" || "$PLAYLIST_TITLE" == "NA" ]] && PLAYLIST_TITLE="Playlist sem nome"
+
+# sanitiza para nome de pasta (remove / : e caracteres de controle)
+SAFE_TITLE="$(
+  printf '%s' "$PLAYLIST_TITLE" \
+    | tr '/:\\' '---' \
+    | tr -d '\000-\037' \
+    | sed -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ *//' -e 's/ *$//' -e 's/\.*$//'
+)"
+[[ -z "$SAFE_TITLE" ]] && SAFE_TITLE="Playlist sem nome"
+
+DEST="${DEST_BASE}/${SAFE_TITLE}"
+mkdir -p "$DEST"
+
+ARCHIVE="${DEST}/.ytm-dl-baixados.txt"
+DL_OPTS=(--progress)  # nunca vazio: bash 3.2 + set -u aborta em "${arr[@]}" vazio
+if (( FORCE )); then
+  rm -f "$ARCHIVE"
+  # sem isto o yt-dlp pula os .wav que já existem e o -f não teria efeito
+  DL_OPTS+=(--force-overwrites)
+fi
+
+echo "→ playlist : ${PLAYLIST_TITLE}"
+echo "→ faixas   : ${TRACK_COUNT:-?}"
+echo "→ destino  : ${DEST}"
+echo "→ formato  : WAV ${BITDEPTH} ${SAMPLE_RATE}Hz $(( CHANNELS == 1 ? 1 : 2 ))ch"
+echo
+
+# ----------------------------------------------------------------- download ---
+set +e
+yt-dlp "${COMMON[@]}" "${DL_OPTS[@]}" \
+  --ignore-errors --no-abort-on-error \
+  --download-archive "$ARCHIVE" \
+  --concurrent-fragments 4 \
+  -N "$JOBS" \
+  --retries 10 --fragment-retries 10 \
+  --format 'bestaudio/best' \
+  --extract-audio --audio-format wav \
+  --postprocessor-args "ExtractAudio:-acodec ${BITDEPTH} -ar ${SAMPLE_RATE} -ac ${CHANNELS}" \
+  --embed-metadata \
+  --parse-metadata '%(track,title)s:%(meta_title)s' \
+  --parse-metadata '%(artist,uploader)s:%(meta_artist)s' \
+  --parse-metadata '%(album,playlist_title)s:%(meta_album)s' \
+  --output "${DEST}/%(playlist_index)02d - %(title)s.%(ext)s" \
+  --output "pl_thumbnail:" \
+  -- "$URL"
+rc=$?
+set -e
+
+# ------------------------------------------------------------------ resumo ---
+WAVS="$(find "$DEST" -maxdepth 1 -type f -name '*.wav' | wc -l | tr -d ' ')"
+echo
+if (( rc != 0 )); then
+  echo "⚠  algumas faixas falharam (yt-dlp saiu com código $rc) — as demais foram baixadas."
+  echo "   rode o mesmo comando de novo para tentar só as que faltam."
+fi
+echo "✓ ${WAVS} arquivo(s) .wav em: ${DEST}"
+du -sh "$DEST" 2>/dev/null | awk '{print "  tamanho total: " $1}'
